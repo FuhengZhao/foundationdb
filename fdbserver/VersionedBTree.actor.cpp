@@ -1916,7 +1916,7 @@ public:
 		evictionOrder.swap(self->evictionOrder);
 
 		state typename EvictionOrderT::iterator i = evictionOrder.begin();
-		state typename EvictionOrderT::iterator iEnd = evictionOrder.begin();
+		state typename EvictionOrderT::iterator iEnd = evictionOrder.end();
 
 		while (i != iEnd) {
 			if (!i->item.evictable()) {
