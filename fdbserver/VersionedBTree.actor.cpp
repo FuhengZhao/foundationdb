@@ -416,7 +416,60 @@ std::string toString(const std::pair<F, S>& o) {
 
 constexpr static int ioMinPriority = 0;
 constexpr static int ioLeafPriority = 1;
-constexpr static int ioMaxPriority = 3;
+constexpr static int ioMaxPriority = 4;
+
+struct ioPriority {
+	// 0 is used for nonBtreeLevel and Btree height is capped at 5
+	constexpr static unsigned int numBtreeLevels = 6; 
+
+	// Create a mapping between (reason, level, IKeyValueStore::ReadType) and priority.
+	// Since all writes beside page header are 0, priority map only concern about read
+	int priorityMap[numBtreeLevels][(size_t)IKeyValueStore::ReadType::MAXIKVSREADTYPE][(size_t)PagerEventReasons::MAXEVENTREASONS];
+
+	ioPriority () {
+		for(int level = 0; level < numBtreeLevels; level++){
+			for(int type = 0; type < (size_t)IKeyValueStore::ReadType::MAXIKVSREADTYPE; type++){
+				for(int reason = 0; reason < (size_t)PagerEventReasons::MAXEVENTREASONS; reason++){
+					if(level == nonBtreeLevel ){
+						// for pager remap copy
+						priorityMap[level][type][reason]= ioLeafPriority;
+					}
+					else if (type == (size_t)IKeyValueStore::ReadType::FETCH){
+						// for data movement
+						priorityMap[level][type][reason] = ioMaxPriority;
+					}
+					else if (reason == (size_t)PagerEventReasons::PointRead ){
+						priorityMap[level][type][reason] = 3;
+					}
+					else if (reason == (size_t)PagerEventReasons::RangeRead ){
+						priorityMap[level][type][reason] = 3;
+					}
+					else if (reason == (size_t)PagerEventReasons::MetaData ){
+						priorityMap[level][type][reason] = 3;
+					}
+					else{
+						priorityMap[level][type][reason] = ioLeafPriority;
+					}
+				}
+			}
+		} 
+	}
+
+	int getPriority(unsigned int level, IKeyValueStore::ReadType type, PagerEventReasons reason){
+		ASSERT(type < IKeyValueStore::ReadType::MAXIKVSREADTYPE && reason < PagerEventReasons::MAXEVENTREASONS);
+		level = std::min(level, numBtreeLevels-1);
+		return priorityMap[level][(size_t)type][(size_t)reason];
+	}
+	void updatePriority(int newVal, unsigned int level, IKeyValueStore::ReadType type, PagerEventReasons reason){
+		ASSERT(newVal >= ioMinPriority && newVal <= ioMaxPriority);
+		ASSERT(type < IKeyValueStore::ReadType::MAXIKVSREADTYPE && reason < PagerEventReasons::MAXEVENTREASONS);
+		level = std::min(level, numBtreeLevels-1);
+		priorityMap[level][(size_t)type][(size_t)reason] = newVal;
+	}
+
+};
+ioPriority g_ioPriority;
+
 
 // A FIFO queue of T stored as a linked list of pages.
 // Main operations are pop(), pushBack(), pushFront(), and flush().
@@ -711,7 +764,7 @@ public:
 			debug_printf(
 			    "FIFOQueue::Cursor(%s) loadPage start id=%s\n", toString().c_str(), ::toString(nextPageID).c_str());
 			nextPageReader = queue->pager->readPage(
-			    PagerEventReasons::MetaData, nonBtreeLevel, nextPageID, ioMaxPriority, true, false);
+			    PagerEventReasons::MetaData, nonBtreeLevel, nextPageID, g_ioPriority, true, false);
 			if (!nextPageReader.isReady()) {
 				nextPageReader = waitOrError(nextPageReader, queue->pagerError);
 			}
@@ -3468,7 +3521,7 @@ public:
 
 			// Read the data from the page that the original was mapped to
 			Reference<ArenaPage> data = wait(
-			    self->readPage(PagerEventReasons::MetaData, nonBtreeLevel, p.newPageID, ioLeafPriority, false, true));
+			    self->readPage(PagerEventReasons::MetaData, nonBtreeLevel, p.newPageID, g_ioPriority, false, true));
 
 			// Write the data to the original page so it can be read using its original pageID
 			self->updatePage(
@@ -5109,7 +5162,7 @@ public:
 				                                    q.get().height,
 				                                    snapshot.getPtr(),
 				                                    q.get().pageID,
-				                                    ioLeafPriority,
+				                                    g_ioPriority,
 				                                    true,
 				                                    false));
 				--toPop;
@@ -6511,7 +6564,7 @@ private:
 		}
 
 		state Reference<const ArenaPage> page = wait(
-		    readPage(self, PagerEventReasons::Commit, height, batch->snapshot.getPtr(), rootID, height, false, true));
+		    readPage(self, PagerEventReasons::Commit, height, batch->snapshot.getPtr(), rootID, g_ioPriority, false, true));
 
 		// If the page exists in the cache, it must be copied before modification.
 		// That copy will be referenced by pageCopy, as page must stay in scope in case anything references its
@@ -7350,6 +7403,7 @@ public:
 
 	private:
 		PagerEventReasons reason;
+		IKeyValueStore::ReadType type;
 		VersionedBTree* btree;
 		Reference<IPagerSnapshot> pager;
 		bool valid;
@@ -7413,7 +7467,7 @@ public:
 			                    path.back().btPage()->height - 1,
 			                    pager.getPtr(),
 			                    link.get().getChildPage(),
-			                    ioMaxPriority,
+			                    g_ioPriority.getPriority(path.back().btPage()->height-1, type, reason),
 			                    false,
 			                    true),
 			           [=](Reference<const ArenaPage> p) {
@@ -7450,9 +7504,11 @@ public:
 		Future<Void> init(VersionedBTree* btree_in,
 		                  PagerEventReasons reason_in,
 		                  Reference<IPagerSnapshot> pager_in,
+						  IKeyValueStore::ReadType type_in,
 		                  BTreeNodeLink root) {
 			btree = btree_in;
 			reason = reason_in;
+			type = type_in;
 			pager = pager_in;
 			path.clear();
 			path.reserve(6);
@@ -7565,7 +7621,7 @@ public:
 				if (c.get().value.present()) {
 					BTreeNodeLinkRef childPage = c.get().getChildPage();
 					if (childPage.size() > 0)
-						preLoadPage(pager.getPtr(), childPage, ioLeafPriority);
+						preLoadPage(pager.getPtr(), childPage, g_ioPriority);
 					recordsRead += estRecordsPerPage;
 					// Use sibling node capacity as an estimate of bytes read.
 					bytesRead += childPage.size() * this->btree->m_blockSize;
@@ -7647,7 +7703,7 @@ public:
 		Future<Void> movePrev() { return path.empty() ? Void() : move_impl(this, false); }
 	};
 
-	Future<Void> initBTreeCursor(BTreeCursor* cursor, Version snapshotVersion, PagerEventReasons reason) {
+	Future<Void> initBTreeCursor(BTreeCursor* cursor, Version snapshotVersion, PagerEventReasons reason, IKeyValueStore::ReadType readType= IKeyValueStore::ReadType::NORMAL) {
 		Reference<IPagerSnapshot> snapshot = m_pager->getReadSnapshot(snapshotVersion);
 
 		BTreeNodeLinkRef root;
@@ -7664,7 +7720,7 @@ public:
 			root = *snapshot->extra.getPtr<BTreeNodeLink>();
 		}
 
-		return cursor->init(this, reason, snapshot, root);
+		return cursor->init(this, reason, snapshot, readType, root);
 	}
 };
 
@@ -7793,15 +7849,16 @@ public:
 		m_tree->set(keyValue);
 	}
 
-	Future<RangeResult> readRange(KeyRangeRef keys, int rowLimit, int byteLimit, IKeyValueStore::ReadType) override {
+	Future<RangeResult> readRange(KeyRangeRef keys, int rowLimit, int byteLimit, IKeyValueStore::ReadType readType) override {
 		debug_printf("READRANGE %s\n", printable(keys).c_str());
-		return catchError(readRange_impl(this, keys, rowLimit, byteLimit));
+		return catchError(readRange_impl(this, keys, rowLimit, byteLimit, readType));
 	}
 
 	ACTOR static Future<RangeResult> readRange_impl(KeyValueStoreRedwood* self,
 	                                                KeyRange keys,
 	                                                int rowLimit,
-	                                                int byteLimit) {
+	                                                int byteLimit,
+													IKeyValueStore::ReadType readType) {
 		state VersionedBTree::BTreeCursor cur;
 		wait(
 		    self->m_tree->initBTreeCursor(&cur, self->m_tree->getLastCommittedVersion(), PagerEventReasons::RangeRead));
@@ -7940,10 +7997,10 @@ public:
 		return result;
 	}
 
-	ACTOR static Future<Optional<Value>> readValue_impl(KeyValueStoreRedwood* self, Key key, Optional<UID> debugID) {
+	ACTOR static Future<Optional<Value>> readValue_impl(KeyValueStoreRedwood* self, Key key, IKeyValueStore::ReadType readType. Optional<UID> debugID) {
 		state VersionedBTree::BTreeCursor cur;
 		wait(
-		    self->m_tree->initBTreeCursor(&cur, self->m_tree->getLastCommittedVersion(), PagerEventReasons::PointRead));
+		    self->m_tree->initBTreeCursor(&cur, self->m_tree->getLastCommittedVersion(), PagerEventReasons::PointRead, readType));
 
 		// Not locking for point reads, instead relying on IO priority lock
 		// state PriorityMultiLock::Lock lock = wait(self->m_concurrentReads.lock());
@@ -7962,15 +8019,15 @@ public:
 		return Optional<Value>();
 	}
 
-	Future<Optional<Value>> readValue(KeyRef key, IKeyValueStore::ReadType, Optional<UID> debugID) override {
-		return catchError(readValue_impl(this, key, debugID));
+	Future<Optional<Value>> readValue(KeyRef key, IKeyValueStore::ReadType readType, Optional<UID> debugID) override {
+		return catchError(readValue_impl(this, key, readType, debugID));
 	}
 
 	Future<Optional<Value>> readValuePrefix(KeyRef key,
 	                                        int maxLength,
-	                                        IKeyValueStore::ReadType,
+	                                        IKeyValueStore::ReadType readType,
 	                                        Optional<UID> debugID) override {
-		return catchError(map(readValue_impl(this, key, debugID), [maxLength](Optional<Value> v) {
+		return catchError(map(readValue_impl(this, key, readType, debugID), [maxLength](Optional<Value> v) {
 			if (v.present() && v.get().size() > maxLength) {
 				v.get().contents() = v.get().substr(0, maxLength);
 			}

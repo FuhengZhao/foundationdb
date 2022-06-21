@@ -73,6 +73,7 @@ public:
 		LOW,
 		NORMAL,
 		HIGH,
+		MAXIKVSREADTYPE
 	};
 
 	virtual Future<Optional<Value>> readValue(KeyRef key,
